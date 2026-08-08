@@ -89,6 +89,8 @@ const CallSetup: React.FC<CallSetupProps> = ({
                   </span>
                   <button
                     onClick={onCopyPeerId}
+                    aria-label="Copy Peer ID"
+                    title="Copy Peer ID"
                     className="btn-ghost transition-colors"
                   >
                     <i className="fas fa-copy"></i>

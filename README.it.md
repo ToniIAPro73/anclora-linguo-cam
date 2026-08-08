@@ -2,7 +2,7 @@
 
 <div align="center">
 
-<img src="./public/brand/anclora-linguo-cam.png" alt="Anclora Linguo Cam" width="132" />
+<img src="./public/brand/anclora-linguo-cam.webp" alt="Anclora Linguo Cam" width="132" />
 
 # Anclora Linguo Cam
 

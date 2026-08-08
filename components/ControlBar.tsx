@@ -92,6 +92,7 @@ const ControlBar: React.FC<ControlBarProps> = ({
       <div className="flex items-center gap-2 bg-elevated px-3 md:px-4 py-1.5 md:py-2 rounded-full border border-border-subtle group">
         <button
           onClick={onToggleMute}
+          aria-label={isMuted || remoteVolume === 0 ? "Unmute remote audio" : "Mute remote audio"}
           className={`text-sm md:text-base ${isMuted || remoteVolume === 0 ? "text-danger" : "text-text-secondary hover:text-text-primary"}`}
         >
           <i
@@ -139,6 +140,8 @@ const ControlBar: React.FC<ControlBarProps> = ({
 
       <button
         onClick={onEndCall}
+        aria-label="End call"
+        title="End call"
         className="btn-danger w-12 h-12 md:w-16 md:h-16 rounded-full flex items-center justify-center transition-all transform hover:scale-110 mx-1"
       >
         <i className="fas fa-phone-slash text-base md:text-xl"></i>

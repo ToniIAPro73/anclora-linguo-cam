@@ -12,6 +12,7 @@ const SfuRoomEmbed: React.FC<SfuRoomEmbedProps> = ({ url }) => {
         title="SFU Room"
         className="w-full h-full"
         allow="camera; microphone; fullscreen; display-capture"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"
       />
     </div>
   );

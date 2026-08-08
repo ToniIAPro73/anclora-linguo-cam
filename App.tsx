@@ -1901,6 +1901,12 @@ const App: React.FC = () => {
       if (peerInstance && !peerInstance.destroyed) {
         peerInstance.destroy();
       }
+      stopMediaStream(cameraStreamRef.current);
+      cameraStreamRef.current = null;
+      stopMediaStream(screenStreamRef.current);
+      screenStreamRef.current = null;
+      stopMediaStream(remoteStreamRef.current);
+      remoteStreamRef.current = null;
     };
   }, [applyBitrateLimit]);
 
