@@ -1,0 +1,11 @@
+{
+  "name": "Anclora Linguo Cam",
+  "description": "Videollamadas con subtítulos y traducción asistida en tiempo real para comunicación multilingüe.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

@@ -1,0 +1,1931 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import datetime
+import hashlib
+import hmac
+import json
+import logging
+import os
+import sqlite3
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Optional
+
+import httpx
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse, StreamingResponse
+from pydantic import BaseModel, ValidationError
+
+from .backends import (
+    ASRBackend,
+    BackendCapabilities,
+    MTBackend,
+    MockASRBackend,
+    MockMTBackend,
+    SessionConfig,
+)
+
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "info").upper()
+logging.basicConfig(level=LOG_LEVEL)
+logger = logging.getLogger("asr-mt")
+
+APP_ENV = os.getenv("APP_ENV", os.getenv("ENVIRONMENT", "local")).strip().lower()
+IS_LOCAL_OR_TEST_ENV = APP_ENV in {"local", "dev", "development", "test", "ci"}
+
+
+def _parse_allowed_origins(raw: str) -> list[str]:
+    return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+
+def _load_session_signing_key() -> str:
+    key = os.getenv("SESSION_SIGNING_KEY", "").strip()
+    insecure_placeholders = {
+        "",
+        "change-me-in-production",
+        "replace-with-strong-random-key",
+        "insecure-dev-key",
+    }
+    if not key:
+        if IS_LOCAL_OR_TEST_ENV:
+            return "local-dev-only-session-signing-key"
+        raise RuntimeError("SESSION_SIGNING_KEY must be set.")
+    if not IS_LOCAL_OR_TEST_ENV and (key in insecure_placeholders or len(key) < 32):
+        raise RuntimeError("SESSION_SIGNING_KEY must be a strong non-placeholder value.")
+    return key
+
+
+app = FastAPI(title="ASR/MT Service", version="0.1.0")
+ALLOWED_ORIGINS = _parse_allowed_origins(
+    os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+)
+if "*" in ALLOWED_ORIGINS and not IS_LOCAL_OR_TEST_ENV:
+    raise RuntimeError("ALLOWED_ORIGINS cannot include '*' outside local/test environments.")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials="*" not in ALLOWED_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+SESSION_SIGNING_KEY = _load_session_signing_key()
+SESSION_TTL_SECONDS = int(os.getenv("SESSION_TTL_SECONDS", "28800"))
+AUDIT_LOG_PATH = Path(os.getenv("AUDIT_LOG_PATH", "runtime/audit-log.jsonl"))
+MAX_TRANSLATION_CHARS_PER_SESSION = int(
+    os.getenv("MAX_TRANSLATION_CHARS_PER_SESSION", "20000")
+)
+MAX_TTS_CHARS_PER_SESSION = int(os.getenv("MAX_TTS_CHARS_PER_SESSION", "12000"))
+COST_PER_TRANSLATED_CHAR_EUR = float(
+    os.getenv("COST_PER_TRANSLATED_CHAR_EUR", "0.0000008")
+)
+COST_PER_TTS_CHAR_EUR = float(os.getenv("COST_PER_TTS_CHAR_EUR", "0.0000004"))
+MT_MICRO_BATCH_WINDOW_MS = int(os.getenv("MT_MICRO_BATCH_WINDOW_MS", "35"))
+MT_MICRO_BATCH_MAX_ITEMS = int(os.getenv("MT_MICRO_BATCH_MAX_ITEMS", "4"))
+MT_MICRO_BATCH_MAX_CHARS = int(os.getenv("MT_MICRO_BATCH_MAX_CHARS", "220"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+RATE_LIMIT_AUTH_SESSION_PER_WINDOW = int(
+    os.getenv("RATE_LIMIT_AUTH_SESSION_PER_WINDOW", "20")
+)
+RATE_LIMIT_CHAT_TRANSLATE_PER_WINDOW = int(
+    os.getenv("RATE_LIMIT_CHAT_TRANSLATE_PER_WINDOW", "120")
+)
+RATE_LIMIT_CHAT_TTS_PER_WINDOW = int(os.getenv("RATE_LIMIT_CHAT_TTS_PER_WINDOW", "120"))
+RATE_LIMIT_ROOMS_PER_WINDOW = int(os.getenv("RATE_LIMIT_ROOMS_PER_WINDOW", "60"))
+RATE_LIMIT_TELEMETRY_PER_WINDOW = int(
+    os.getenv("RATE_LIMIT_TELEMETRY_PER_WINDOW", "240")
+)
+RATE_LIMIT_GEMINI_TOKEN_PER_WINDOW = int(
+    os.getenv("RATE_LIMIT_GEMINI_TOKEN_PER_WINDOW", "60")
+)
+RATE_LIMIT_WS_MESSAGES_PER_WINDOW = int(
+    os.getenv("RATE_LIMIT_WS_MESSAGES_PER_WINDOW", "1200")
+)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_AUTH_TOKENS_URL = os.getenv(
+    "GEMINI_AUTH_TOKENS_URL",
+    "https://generativelanguage.googleapis.com/v1beta/auth_tokens",
+)
+GEMINI_LIVE_TRANSLATE_MODEL = os.getenv(
+    "GEMINI_LIVE_TRANSLATE_MODEL",
+    "models/gemini-3.5-live-translate-preview",
+)
+MAX_TELEMETRY_PAYLOAD_KEYS = int(os.getenv("MAX_TELEMETRY_PAYLOAD_KEYS", "24"))
+MAX_TELEMETRY_PAYLOAD_VALUE_CHARS = int(
+    os.getenv("MAX_TELEMETRY_PAYLOAD_VALUE_CHARS", "120")
+)
+TELEMETRY_SCHEMA_VERSION = "telemetry.v1"
+TELEMETRY_BLOCKED_FIELDS = {
+    "audio",
+    "email",
+    "full_name",
+    "name",
+    "display_name",
+    "phone",
+    "video",
+    "text",
+    "raw_text",
+    "transcript",
+    "message",
+    "translated_text",
+}
+TELEMETRY_BLOCKED_KEY_PARTS = {"email", "name", "phone", "transcript", "message", "text"}
+TRANSLATION_PROVIDER_VALUES = {"oss", "gemini", "ab"}
+
+SESSION_USAGE: dict[str, dict[str, int]] = {}
+TRANSLATION_CACHE: dict[str, str] = {}
+ROOM_PARTICIPANT_TTL_SECONDS = int(os.getenv("ROOM_PARTICIPANT_TTL_SECONDS", "180"))
+ROOM_REGISTRY: dict[str, dict[str, dict[str, Any]]] = {}
+MAX_TELEMETRY_EVENTS_PER_SESSION = int(os.getenv("MAX_TELEMETRY_EVENTS_PER_SESSION", "500"))
+TELEMETRY_RETENTION_SECONDS = int(os.getenv("TELEMETRY_RETENTION_SECONDS", "86400"))
+TELEMETRY_EVENTS: dict[str, list[dict[str, Any]]] = {}
+
+
+def _gemini_error_detail(response: httpx.Response) -> str:
+    try:
+        error = response.json().get("error", {})
+    except ValueError:
+        error = {}
+    status = str(error.get("status") or response.status_code)
+    message = str(error.get("message") or response.text or "unknown error")
+    safe_message = " ".join(message.split())[:240]
+    return f"Gemini token service rejected request ({status}): {safe_message}"
+
+
+def _create_gemini_live_token_with_sdk(target_language: str) -> dict[str, Any]:
+    from google import genai
+
+    now = datetime.datetime.now(tz=datetime.timezone.utc)
+    model = GEMINI_LIVE_TRANSLATE_MODEL.removeprefix("models/")
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    token = client.auth_tokens.create(
+        config={
+            "uses": 1,
+            "expire_time": now + datetime.timedelta(minutes=30),
+            "new_session_expire_time": now + datetime.timedelta(minutes=1),
+            "live_connect_constraints": {
+                "model": model,
+                "config": {
+                    "response_modalities": ["AUDIO"],
+                    "input_audio_transcription": {},
+                    "output_audio_transcription": {},
+                    "translation_config": {
+                        "target_language_code": target_language,
+                        "echo_target_language": True,
+                    },
+                },
+            },
+        }
+    )
+    return {
+        "name": getattr(token, "name", None),
+        "expireTime": getattr(token, "expire_time", None),
+    }
+
+
+def _safe_exception_message(error: Exception) -> str:
+    return " ".join(str(error).split())[:240] or error.__class__.__name__
+STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "memory").strip().lower()
+SQLITE_DB_PATH = Path(os.getenv("SQLITE_DB_PATH", "runtime/asr-mt.sqlite3"))
+SQLITE_LOCK = threading.Lock()
+RATE_LIMIT_LOCK = threading.Lock()
+RATE_LIMIT_BUCKETS: dict[str, list[float]] = {}
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+
+def _sign_payload(payload: dict[str, Any]) -> str:
+    serialized = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    signature = hmac.new(SESSION_SIGNING_KEY.encode("utf-8"), serialized, hashlib.sha256).digest()
+    return f"{_b64url(serialized)}.{_b64url(signature)}"
+
+
+def _validate_token(token: str) -> dict[str, Any]:
+    try:
+        encoded_payload, encoded_sig = token.split(".", 1)
+        payload_raw = _b64url_decode(encoded_payload)
+        expected_sig = hmac.new(
+            SESSION_SIGNING_KEY.encode("utf-8"), payload_raw, hashlib.sha256
+        ).digest()
+        received_sig = _b64url_decode(encoded_sig)
+        if not hmac.compare_digest(expected_sig, received_sig):
+            raise ValueError("invalid signature")
+        payload = json.loads(payload_raw.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=401, detail="invalid token") from exc
+
+    if int(payload.get("exp", 0)) < int(time.time()):
+        raise HTTPException(status_code=401, detail="expired token")
+    return payload
+
+
+def _append_audit_event(event_type: str, payload: dict[str, Any]) -> None:
+    AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    line = {
+        "event_type": event_type,
+        "timestamp_ms": int(time.time() * 1000),
+        **payload,
+    }
+    with AUDIT_LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(line, ensure_ascii=True) + "\n")
+
+
+def _sanitize_telemetry_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    sanitized: dict[str, Any] = {}
+    for key, value in payload.items():
+        if len(sanitized) >= MAX_TELEMETRY_PAYLOAD_KEYS:
+            break
+        normalized_key = str(key).strip().lower()
+        if (
+            not normalized_key
+            or normalized_key in TELEMETRY_BLOCKED_FIELDS
+            or any(part in normalized_key for part in TELEMETRY_BLOCKED_KEY_PARTS)
+        ):
+            continue
+        if isinstance(value, (bool, int, float)) or value is None:
+            sanitized[normalized_key] = value
+            continue
+        if isinstance(value, str):
+            trimmed = value.strip()
+            if len(trimmed) > MAX_TELEMETRY_PAYLOAD_VALUE_CHARS:
+                trimmed = trimmed[:MAX_TELEMETRY_PAYLOAD_VALUE_CHARS]
+            sanitized[normalized_key] = trimmed
+            continue
+        if isinstance(value, list):
+            compact: list[Any] = []
+            for item in value[:25]:
+                if isinstance(item, (bool, int, float)):
+                    compact.append(item)
+            sanitized[normalized_key] = compact
+            continue
+    return sanitized
+
+
+def _request_identity(request: Request) -> str:
+    client = request.client
+    if client and client.host:
+        return client.host
+    return "unknown"
+
+
+def _websocket_identity(websocket: WebSocket) -> str:
+    client = websocket.client
+    if client and client.host:
+        return client.host
+    return "unknown"
+
+
+def _is_rate_limited(scope: str, identity: str, limit: int) -> bool:
+    if limit <= 0:
+        return False
+    now = time.time()
+    threshold = now - RATE_LIMIT_WINDOW_SECONDS
+    bucket_key = f"{scope}:{identity}"
+
+    with RATE_LIMIT_LOCK:
+        bucket = RATE_LIMIT_BUCKETS.get(bucket_key)
+        if bucket is None:
+            bucket = []
+            RATE_LIMIT_BUCKETS[bucket_key] = bucket
+        pruned = [ts for ts in bucket if ts >= threshold]
+        if len(pruned) >= limit:
+            RATE_LIMIT_BUCKETS[bucket_key] = pruned
+            return True
+        pruned.append(now)
+        RATE_LIMIT_BUCKETS[bucket_key] = pruned
+        return False
+
+
+def _enforce_rate_limit(scope: str, identity: str, limit: int) -> None:
+    if _is_rate_limited(scope, identity, limit):
+        raise HTTPException(status_code=429, detail=f"rate limit exceeded for {scope}")
+
+
+def _sqlite_conn() -> sqlite3.Connection:
+    SQLITE_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(SQLITE_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_sqlite_storage() -> None:
+    if STORAGE_BACKEND != "sqlite":
+        return
+    with SQLITE_LOCK:
+        with _sqlite_conn() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS room_presence (
+                    room_code TEXT NOT NULL,
+                    peer_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    last_seen INTEGER NOT NULL,
+                    PRIMARY KEY (room_code, peer_id)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS telemetry_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    call_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_telemetry_user_id
+                ON telemetry_events(user_id)
+                """
+            )
+            conn.commit()
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    if STORAGE_BACKEND not in {"memory", "sqlite"}:
+        raise RuntimeError(f"Unsupported STORAGE_BACKEND={STORAGE_BACKEND}")
+    _init_sqlite_storage()
+
+
+class ConfigMessage(BaseModel):
+    type: str
+    session_id: str
+    source_lang: str
+    target_lang: str
+    sample_rate: int = 16000
+    format: str = "s16le"
+
+
+class EndMessage(BaseModel):
+    type: str
+
+
+class SessionCreateRequest(BaseModel):
+    display_name: str
+    role: str
+
+
+class SessionCreateResponse(BaseModel):
+    token: str
+    user_id: str
+    expires_at: int
+
+
+class SessionValidateRequest(BaseModel):
+    token: str
+
+
+class GeminiLiveTokenRequest(BaseModel):
+    token: str
+    target_language_code: str = "es"
+
+
+class GeminiLiveTokenResponse(BaseModel):
+    token: str
+    expire_time: Optional[str] = None
+
+
+class ChatTranslateRequest(BaseModel):
+    token: str
+    text: str
+    source_lang: str
+    target_lang: str
+
+
+class ChatTranslateResponse(BaseModel):
+    translated_text: str
+
+
+class ChatTTSRequest(BaseModel):
+    token: str
+    text: str
+    source_lang: str
+    target_lang: str
+
+
+class ChatTTSResponse(BaseModel):
+    text_to_speak: str
+    voice_lang: str
+
+
+class ConsentEventRequest(BaseModel):
+    token: str
+    call_id: str
+    consent_recording: bool
+
+
+class ConsentEventResponse(BaseModel):
+    status: str
+    consent_id: str
+
+
+class SessionUsageRequest(BaseModel):
+    token: str
+
+
+class SessionUsageResponse(BaseModel):
+    translated_chars: int
+    tts_chars: int
+    translated_limit: int
+    tts_limit: int
+
+
+class SessionCostRequest(BaseModel):
+    token: str
+
+
+class SessionCostResponse(BaseModel):
+    translated_chars: int
+    tts_chars: int
+    estimated_translation_cost_eur: float
+    estimated_tts_cost_eur: float
+    estimated_total_cost_eur: float
+
+
+class SessionCostDashboardRequest(BaseModel):
+    token: str
+    limit: int = 10
+
+
+class SessionCostDashboardItem(BaseModel):
+    call_id: str
+    timestamp_ms: int
+    estimated_total_cost_eur: float
+    bitrate_kbps: Optional[int]
+    packet_loss_pct: Optional[float]
+    latency_ms: Optional[int]
+
+
+class SessionCostDashboardResponse(BaseModel):
+    total_calls: int
+    total_estimated_cost_eur: float
+    average_cost_per_call_eur: float
+    recent_calls: list[SessionCostDashboardItem]
+
+
+class RoomRegisterRequest(BaseModel):
+    token: str
+    room_code: str
+    peer_id: str
+
+
+class RoomRegisterResponse(BaseModel):
+    status: str
+    room_code: str
+    participants: int
+
+
+class RoomResolveRequest(BaseModel):
+    token: str
+    room_code: str
+    requester_peer_id: str
+
+
+class RoomResolveResponse(BaseModel):
+    room_code: str
+    participants: int
+    target_peer_id: Optional[str]
+    initiator_peer_id: Optional[str]
+
+
+class BotIntegrationSessionRequest(BaseModel):
+    token: str
+    provider: str
+    external_meeting_id: str
+    bot_display_name: str = "Anclora Linguo Bot"
+
+
+class BotIntegrationSessionResponse(BaseModel):
+    status: str
+    provider: str
+    external_meeting_id: str
+    bot_token: str
+    ingest_ws_url: str
+    expires_at: int
+
+
+class TelemetryEvent(BaseModel):
+    type: str
+    timestamp_ms: int
+    schema_version: str = TELEMETRY_SCHEMA_VERSION
+    payload: dict[str, Any] = {}
+
+
+class TelemetryBatchRequest(BaseModel):
+    token: str
+    call_id: str
+    events: list[TelemetryEvent]
+
+
+class TelemetryBatchResponse(BaseModel):
+    status: str
+    accepted_events: int
+    total_events_in_session: int
+
+
+class TelemetrySummaryRequest(BaseModel):
+    token: str
+
+
+class TelemetrySummaryResponse(BaseModel):
+    schema_version: str
+    total_events: int
+    call_started: int
+    call_ended: int
+    reconnect_events: int
+    precheck_failures: int
+    caption_metrics_events: int
+    webrtc_metrics_events: int
+    error_events: int
+    timeout_events: int
+    ttfc_ms_p50: Optional[int]
+    ttfc_ms_p95: Optional[int]
+    caption_lag_ms_p50: Optional[int]
+    caption_lag_ms_p95: Optional[int]
+    webrtc_rtt_ms_p95: Optional[int]
+    webrtc_jitter_ms_p95: Optional[int]
+    webrtc_packet_loss_pct_p95: Optional[int]
+    webrtc_bitrate_kbps_p50: Optional[int]
+    latest_webrtc_quality: Optional[str]
+    dropped_hypothesis_rate_pct_avg: Optional[float]
+
+
+class TelemetrySLORequest(BaseModel):
+    token: str
+
+
+class TelemetrySLOResponse(BaseModel):
+    pass_slo: bool
+    ttfc_ms_p50: Optional[int]
+    ttfc_ms_p95: Optional[int]
+    caption_lag_ms_p95: Optional[int]
+    dropped_hypothesis_rate_pct_avg: Optional[float]
+    threshold_ttfc_ms_p50: int
+    threshold_ttfc_ms_p95: int
+    threshold_caption_lag_ms_p95: int
+
+
+class ModelRecommendationResponse(BaseModel):
+    asr_backend: str
+    mt_backend: str
+    cpu_ops_per_ms: int
+    gpu_hint: bool
+    threshold_dropped_hypothesis_rate_pct: float
+
+
+class BackendCapabilityResponse(BaseModel):
+    name: str
+    streaming: bool
+    partial_results: bool
+    supported_languages: list[str]
+    supported_pairs: list[str]
+    requires_ml_dependencies: bool
+    notes: str
+
+
+class BackendCapabilitiesResponse(BaseModel):
+    asr_backends: list[BackendCapabilityResponse]
+    mt_backends: list[BackendCapabilityResponse]
+    active_asr_backend: str
+    active_mt_backend: str
+    translation_provider: str
+    qa_ab_enabled: bool
+    qa_ab_percent: int
+
+
+class ProviderSelectionRequest(BaseModel):
+    session_id: str
+
+
+class ProviderSelectionResponse(BaseModel):
+    provider: str
+    ab_bucket: int
+    qa_ab_enabled: bool
+    qa_ab_percent: int
+
+
+def _usage_bucket(user_id: str) -> dict[str, int]:
+    bucket = SESSION_USAGE.get(user_id)
+    if bucket is None:
+        bucket = {"translated_chars": 0, "tts_chars": 0}
+        SESSION_USAGE[user_id] = bucket
+    return bucket
+
+
+def _cache_key(text: str, source_lang: str, target_lang: str) -> str:
+    return f"{source_lang}:{target_lang}:{text.strip().lower()}"
+
+
+def _translate_with_cache(mt_backend: MTBackend, text: str, source_lang: str, target_lang: str) -> str:
+    key = _cache_key(text, source_lang, target_lang)
+    cached = TRANSLATION_CACHE.get(key)
+    if cached is not None:
+        return cached
+    translated = mt_backend.translate(text, source_lang, target_lang)
+    TRANSLATION_CACHE[key] = translated
+    if len(TRANSLATION_CACHE) > 5000:
+        TRANSLATION_CACHE.pop(next(iter(TRANSLATION_CACHE)))
+    return translated
+
+
+def _translate_with_cache_many(
+    mt_backend: MTBackend,
+    texts: list[str],
+    source_lang: str,
+    target_lang: str,
+) -> list[str]:
+    if not texts:
+        return []
+
+    results: list[Optional[str]] = [None] * len(texts)
+    missing_texts: list[str] = []
+    missing_keys: list[str] = []
+    key_to_result_indexes: dict[str, list[int]] = {}
+
+    for idx, text in enumerate(texts):
+        key = _cache_key(text, source_lang, target_lang)
+        cached = TRANSLATION_CACHE.get(key)
+        if cached is not None:
+            results[idx] = cached
+            continue
+        key_to_result_indexes.setdefault(key, []).append(idx)
+        if key_to_result_indexes[key] == [idx]:
+            missing_keys.append(key)
+            missing_texts.append(text)
+
+    if missing_texts:
+        translated_missing = mt_backend.translate_many(
+            missing_texts, source_lang, target_lang
+        )
+        for key, translated in zip(missing_keys, translated_missing):
+            TRANSLATION_CACHE[key] = translated
+            if len(TRANSLATION_CACHE) > 5000:
+                TRANSLATION_CACHE.pop(next(iter(TRANSLATION_CACHE)))
+            for idx in key_to_result_indexes[key]:
+                results[idx] = translated
+
+    return [text or "" for text in results]
+
+
+def _normalize_room_code(room_code: str) -> str:
+    return room_code.strip().upper().replace(" ", "")
+
+
+def _cleanup_room(room_code: str) -> None:
+    if STORAGE_BACKEND == "sqlite":
+        threshold = int(time.time()) - ROOM_PARTICIPANT_TTL_SECONDS
+        with SQLITE_LOCK:
+            with _sqlite_conn() as conn:
+                conn.execute(
+                    "DELETE FROM room_presence WHERE room_code = ? AND last_seen < ?",
+                    (room_code, threshold),
+                )
+                conn.commit()
+        return
+
+    room = ROOM_REGISTRY.get(room_code)
+    if room is None:
+        return
+    now = int(time.time())
+    stale_peers = [
+        peer_id
+        for peer_id, entry in room.items()
+        if (now - int(entry.get("last_seen", 0))) > ROOM_PARTICIPANT_TTL_SECONDS
+    ]
+    for peer_id in stale_peers:
+        room.pop(peer_id, None)
+    if not room:
+        ROOM_REGISTRY.pop(room_code, None)
+
+
+def _telemetry_bucket(user_id: str) -> list[dict[str, Any]]:
+    threshold_ms = int((time.time() - TELEMETRY_RETENTION_SECONDS) * 1000)
+    if STORAGE_BACKEND == "sqlite":
+        with SQLITE_LOCK:
+            with _sqlite_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT call_id, event_type, timestamp_ms, payload_json
+                    FROM telemetry_events
+                    WHERE user_id = ? AND timestamp_ms >= ?
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (user_id, threshold_ms, MAX_TELEMETRY_EVENTS_PER_SESSION),
+                ).fetchall()
+        return [
+            {
+                "call_id": row["call_id"],
+                "type": row["event_type"],
+                "timestamp_ms": row["timestamp_ms"],
+                "payload": json.loads(row["payload_json"]),
+            }
+            for row in rows
+        ]
+
+    bucket = TELEMETRY_EVENTS.get(user_id)
+    if bucket is None:
+        bucket = []
+        TELEMETRY_EVENTS[user_id] = bucket
+    else:
+        bucket[:] = [event for event in bucket if int(event.get("timestamp_ms", 0)) >= threshold_ms]
+    return bucket
+
+
+def _telemetry_events_global() -> list[dict[str, Any]]:
+    threshold_ms = int((time.time() - TELEMETRY_RETENTION_SECONDS) * 1000)
+    if STORAGE_BACKEND == "sqlite":
+        with SQLITE_LOCK:
+            with _sqlite_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT user_id, call_id, event_type, timestamp_ms, payload_json
+                    FROM telemetry_events
+                    WHERE timestamp_ms >= ?
+                    ORDER BY id ASC
+                    """,
+                    (threshold_ms,),
+                ).fetchall()
+        return [
+            {
+                "user_id": row["user_id"],
+                "call_id": row["call_id"],
+                "type": row["event_type"],
+                "timestamp_ms": row["timestamp_ms"],
+                "payload": json.loads(row["payload_json"]),
+            }
+            for row in rows
+        ]
+
+    events: list[dict[str, Any]] = []
+    for user_id, bucket in TELEMETRY_EVENTS.items():
+        filtered = [
+            event for event in bucket if int(event.get("timestamp_ms", 0)) >= threshold_ms
+        ]
+        if len(filtered) != len(bucket):
+            TELEMETRY_EVENTS[user_id] = filtered
+        for event in filtered:
+            enriched = dict(event)
+            enriched["user_id"] = user_id
+            events.append(enriched)
+    return events
+
+
+def _active_room_participants_count() -> int:
+    if STORAGE_BACKEND == "sqlite":
+        threshold = int(time.time()) - ROOM_PARTICIPANT_TTL_SECONDS
+        with SQLITE_LOCK:
+            with _sqlite_conn() as conn:
+                conn.execute("DELETE FROM room_presence WHERE last_seen < ?", (threshold,))
+                row = conn.execute("SELECT COUNT(*) AS count FROM room_presence").fetchone()
+                conn.commit()
+        return int(row["count"] if row else 0)
+
+    now = int(time.time())
+    total = 0
+    for room in ROOM_REGISTRY.values():
+        total += sum(
+            1
+            for entry in room.values()
+            if (now - int(entry.get("last_seen", 0))) <= ROOM_PARTICIPANT_TTL_SECONDS
+        )
+    return total
+
+
+def _upsert_room_presence(
+    room_code: str,
+    peer_id: str,
+    user_id: str,
+    display_name: str,
+) -> int:
+    if STORAGE_BACKEND == "sqlite":
+        now = int(time.time())
+        threshold = now - ROOM_PARTICIPANT_TTL_SECONDS
+        with SQLITE_LOCK:
+            with _sqlite_conn() as conn:
+                conn.execute(
+                    "DELETE FROM room_presence WHERE room_code = ? AND last_seen < ?",
+                    (room_code, threshold),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO room_presence (room_code, peer_id, user_id, display_name, last_seen)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(room_code, peer_id) DO UPDATE SET
+                      user_id=excluded.user_id,
+                      display_name=excluded.display_name,
+                      last_seen=excluded.last_seen
+                    """,
+                    (room_code, peer_id, user_id, display_name, now),
+                )
+                participants = conn.execute(
+                    "SELECT COUNT(*) AS count FROM room_presence WHERE room_code = ?",
+                    (room_code,),
+                ).fetchone()["count"]
+                conn.commit()
+        return int(participants)
+
+    room = ROOM_REGISTRY.setdefault(room_code, {})
+    room[peer_id] = {
+        "user_id": user_id,
+        "display_name": display_name,
+        "last_seen": int(time.time()),
+    }
+    _cleanup_room(room_code)
+    return len(ROOM_REGISTRY.get(room_code, {}))
+
+
+def _resolve_room_participants(room_code: str, requester_peer_id: str) -> RoomResolveResponse:
+    if STORAGE_BACKEND == "sqlite":
+        threshold = int(time.time()) - ROOM_PARTICIPANT_TTL_SECONDS
+        with SQLITE_LOCK:
+            with _sqlite_conn() as conn:
+                conn.execute(
+                    "DELETE FROM room_presence WHERE room_code = ? AND last_seen < ?",
+                    (room_code, threshold),
+                )
+                rows = conn.execute(
+                    """
+                    SELECT peer_id
+                    FROM room_presence
+                    WHERE room_code = ?
+                    ORDER BY peer_id ASC
+                    """,
+                    (room_code,),
+                ).fetchall()
+                conn.commit()
+        participant_peer_ids = [row["peer_id"] for row in rows]
+    else:
+        _cleanup_room(room_code)
+        room = ROOM_REGISTRY.get(room_code, {})
+        participant_peer_ids = sorted(room.keys())
+
+    target_peer_id = next(
+        (peer for peer in participant_peer_ids if peer != requester_peer_id), None
+    )
+    initiator_peer_id = participant_peer_ids[0] if len(participant_peer_ids) >= 2 else None
+    return RoomResolveResponse(
+        room_code=room_code,
+        participants=len(participant_peer_ids),
+        target_peer_id=target_peer_id,
+        initiator_peer_id=initiator_peer_id,
+    )
+
+
+def _append_telemetry_event(
+    user_id: str,
+    call_id: str,
+    event_type: str,
+    timestamp_ms: int,
+    schema_version: str,
+    payload: dict[str, Any],
+) -> bool:
+    sanitized_payload = _sanitize_telemetry_payload(
+        {
+            "schema_version": schema_version or TELEMETRY_SCHEMA_VERSION,
+            **payload,
+        }
+    )
+    threshold_ms = int((time.time() - TELEMETRY_RETENTION_SECONDS) * 1000)
+    if STORAGE_BACKEND == "sqlite":
+        with SQLITE_LOCK:
+            with _sqlite_conn() as conn:
+                conn.execute(
+                    "DELETE FROM telemetry_events WHERE user_id = ? AND timestamp_ms < ?",
+                    (user_id, threshold_ms),
+                )
+                current_count = conn.execute(
+                    "SELECT COUNT(*) AS count FROM telemetry_events WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()["count"]
+                if int(current_count) >= MAX_TELEMETRY_EVENTS_PER_SESSION:
+                    return False
+                conn.execute(
+                    """
+                    INSERT INTO telemetry_events (user_id, call_id, event_type, timestamp_ms, payload_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        call_id,
+                        event_type,
+                        timestamp_ms,
+                        json.dumps(sanitized_payload, ensure_ascii=True),
+                    ),
+                )
+                conn.commit()
+        return True
+
+    bucket = _telemetry_bucket(user_id)
+    if len(bucket) >= MAX_TELEMETRY_EVENTS_PER_SESSION:
+        return False
+    bucket.append(
+        {
+            "call_id": call_id,
+            "type": event_type,
+            "schema_version": schema_version or TELEMETRY_SCHEMA_VERSION,
+            "timestamp_ms": timestamp_ms,
+            "payload": sanitized_payload,
+        }
+    )
+    return True
+
+
+def _percentile(values: list[int], p: int) -> Optional[int]:
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    idx = max(0, min(len(sorted_values) - 1, int((p / 100) * len(sorted_values) + 0.9999) - 1))
+    return sorted_values[idx]
+
+
+def _build_telemetry_summary(bucket: list[dict[str, Any]]) -> TelemetrySummaryResponse:
+    call_started = sum(1 for event in bucket if event.get("type") == "call_started")
+    call_ended = sum(1 for event in bucket if event.get("type") == "call_ended")
+    reconnect_events = sum(
+        1
+        for event in bucket
+        if event.get("type") in {"peer_reconnecting", "subtitle_reconnecting"}
+    )
+    precheck_failures = sum(
+        1
+        for event in bucket
+        if event.get("type") == "precheck_result"
+        and not bool(event.get("payload", {}).get("ok", False))
+    )
+    caption_metric_events = [event for event in bucket if event.get("type") == "caption_metrics"]
+    webrtc_metric_events = [event for event in bucket if event.get("type") == "webrtc_metrics"]
+    error_events = sum(1 for event in bucket if str(event.get("type", "")).endswith("_error"))
+    timeout_events = sum(1 for event in bucket if str(event.get("type", "")).endswith("_timeout"))
+    ttfc_values: list[int] = []
+    caption_lag_values: list[int] = []
+    dropped_rates: list[float] = []
+    rtt_values: list[int] = []
+    jitter_values: list[int] = []
+    loss_values: list[int] = []
+    bitrate_values: list[int] = []
+    latest_webrtc_quality: Optional[str] = None
+    for event in caption_metric_events:
+        payload_data = event.get("payload", {})
+        ttfc_value = payload_data.get("ttfc_ms")
+        if isinstance(ttfc_value, (int, float)) and ttfc_value >= 0:
+            ttfc_values.append(int(ttfc_value))
+        lag_samples = payload_data.get("caption_lag_samples_ms")
+        if isinstance(lag_samples, list):
+            for sample in lag_samples:
+                if isinstance(sample, (int, float)) and sample >= 0:
+                    caption_lag_values.append(int(sample))
+        dropped_rate = payload_data.get("dropped_hypothesis_rate_pct")
+        if isinstance(dropped_rate, (int, float)) and dropped_rate >= 0:
+            dropped_rates.append(float(dropped_rate))
+    for event in webrtc_metric_events:
+        payload_data = event.get("payload", {})
+        for key, target in (
+            ("rtt_ms", rtt_values),
+            ("jitter_ms", jitter_values),
+            ("packet_loss_pct", loss_values),
+            ("bitrate_kbps", bitrate_values),
+        ):
+            value = payload_data.get(key)
+            if isinstance(value, (int, float)) and value >= 0:
+                target.append(int(value))
+        quality = payload_data.get("quality")
+        if quality in {"good", "medium", "bad", "unknown"}:
+            latest_webrtc_quality = str(quality)
+
+    return TelemetrySummaryResponse(
+        schema_version=TELEMETRY_SCHEMA_VERSION,
+        total_events=len(bucket),
+        call_started=call_started,
+        call_ended=call_ended,
+        reconnect_events=reconnect_events,
+        precheck_failures=precheck_failures,
+        caption_metrics_events=len(caption_metric_events),
+        webrtc_metrics_events=len(webrtc_metric_events),
+        error_events=error_events,
+        timeout_events=timeout_events,
+        ttfc_ms_p50=_percentile(ttfc_values, 50),
+        ttfc_ms_p95=_percentile(ttfc_values, 95),
+        caption_lag_ms_p50=_percentile(caption_lag_values, 50),
+        caption_lag_ms_p95=_percentile(caption_lag_values, 95),
+        webrtc_rtt_ms_p95=_percentile(rtt_values, 95),
+        webrtc_jitter_ms_p95=_percentile(jitter_values, 95),
+        webrtc_packet_loss_pct_p95=_percentile(loss_values, 95),
+        webrtc_bitrate_kbps_p50=_percentile(bitrate_values, 50),
+        latest_webrtc_quality=latest_webrtc_quality,
+        dropped_hypothesis_rate_pct_avg=(
+            round(sum(dropped_rates) / len(dropped_rates), 2) if dropped_rates else None
+        ),
+    )
+
+
+def _to_metric_value(value: Optional[int | float]) -> str:
+    if value is None:
+        return "nan"
+    return str(value)
+
+
+def _build_prometheus_metrics() -> str:
+    events = _telemetry_events_global()
+    summary = _build_telemetry_summary(events)
+
+    lines = [
+        "# HELP asrmt_up Service health status (1=up).",
+        "# TYPE asrmt_up gauge",
+        "asrmt_up 1",
+        "# HELP asrmt_rooms_active_participants Active room participants currently tracked.",
+        "# TYPE asrmt_rooms_active_participants gauge",
+        f"asrmt_rooms_active_participants {_active_room_participants_count()}",
+        "# HELP asrmt_telemetry_events_total Telemetry events retained in backend storage.",
+        "# TYPE asrmt_telemetry_events_total gauge",
+        f"asrmt_telemetry_events_total {summary.total_events}",
+        "# HELP asrmt_calls_started_total Count of call_started events.",
+        "# TYPE asrmt_calls_started_total counter",
+        f"asrmt_calls_started_total {summary.call_started}",
+        "# HELP asrmt_calls_ended_total Count of call_ended events.",
+        "# TYPE asrmt_calls_ended_total counter",
+        f"asrmt_calls_ended_total {summary.call_ended}",
+        "# HELP asrmt_reconnect_events_total Count of reconnect events.",
+        "# TYPE asrmt_reconnect_events_total counter",
+        f"asrmt_reconnect_events_total {summary.reconnect_events}",
+        "# HELP asrmt_precheck_failures_total Count of failed prechecks.",
+        "# TYPE asrmt_precheck_failures_total counter",
+        f"asrmt_precheck_failures_total {summary.precheck_failures}",
+        "# HELP asrmt_caption_ttfc_ms_p95 95th percentile TTFC in milliseconds.",
+        "# TYPE asrmt_caption_ttfc_ms_p95 gauge",
+        f"asrmt_caption_ttfc_ms_p95 {_to_metric_value(summary.ttfc_ms_p95)}",
+        "# HELP asrmt_caption_lag_ms_p95 95th percentile caption lag in milliseconds.",
+        "# TYPE asrmt_caption_lag_ms_p95 gauge",
+        f"asrmt_caption_lag_ms_p95 {_to_metric_value(summary.caption_lag_ms_p95)}",
+        "# HELP asrmt_webrtc_rtt_ms_p95 95th percentile WebRTC RTT in milliseconds.",
+        "# TYPE asrmt_webrtc_rtt_ms_p95 gauge",
+        f"asrmt_webrtc_rtt_ms_p95 {_to_metric_value(summary.webrtc_rtt_ms_p95)}",
+        "# HELP asrmt_webrtc_packet_loss_pct_p95 95th percentile WebRTC packet loss percentage.",
+        "# TYPE asrmt_webrtc_packet_loss_pct_p95 gauge",
+        f"asrmt_webrtc_packet_loss_pct_p95 {_to_metric_value(summary.webrtc_packet_loss_pct_p95)}",
+        "# HELP asrmt_webrtc_jitter_ms_p95 95th percentile WebRTC jitter in milliseconds.",
+        "# TYPE asrmt_webrtc_jitter_ms_p95 gauge",
+        f"asrmt_webrtc_jitter_ms_p95 {_to_metric_value(summary.webrtc_jitter_ms_p95)}",
+        "# HELP asrmt_telemetry_errors_total Count of retained telemetry error events.",
+        "# TYPE asrmt_telemetry_errors_total counter",
+        f"asrmt_telemetry_errors_total {summary.error_events}",
+        "# HELP asrmt_telemetry_timeouts_total Count of retained telemetry timeout events.",
+        "# TYPE asrmt_telemetry_timeouts_total counter",
+        f"asrmt_telemetry_timeouts_total {summary.timeout_events}",
+        (
+            "# HELP asrmt_dropped_hypothesis_rate_pct_avg "
+            "Average dropped hypothesis rate percentage."
+        ),
+        "# TYPE asrmt_dropped_hypothesis_rate_pct_avg gauge",
+        (
+            "asrmt_dropped_hypothesis_rate_pct_avg "
+            f"{_to_metric_value(summary.dropped_hypothesis_rate_pct_avg)}"
+        ),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _cpu_ops_per_ms(sample_ms: int = 60) -> int:
+    start = time.perf_counter()
+    deadline = start + (sample_ms / 1000.0)
+    acc = 0
+    ops = 0
+    while time.perf_counter() < deadline:
+        acc = (acc * 1664525 + 1013904223) & 0xFFFFFFFF
+        ops += 1
+    elapsed_ms = max(1.0, (time.perf_counter() - start) * 1000)
+    _ = acc
+    return int(ops / elapsed_ms)
+
+
+def _gpu_hint_available() -> bool:
+    explicit = os.getenv("ASR_DEVICE", "").strip().lower()
+    if explicit.startswith("cuda"):
+        return True
+    cuda_env = os.getenv("CUDA_VISIBLE_DEVICES", "").strip()
+    if cuda_env and cuda_env not in {"-1", "none", "None"}:
+        return True
+    return False
+
+
+def _choose_auto_asr_backend() -> str:
+    if _gpu_hint_available():
+        return "faster-whisper"
+    ops_per_ms = _cpu_ops_per_ms()
+    threshold = int(os.getenv("ASR_AUTO_QUALITY_CPU_THRESHOLD_OPS_MS", "8500"))
+    return "faster-whisper" if ops_per_ms >= threshold else "vosk"
+
+
+def _choose_auto_mt_backend() -> str:
+    preferred = os.getenv("MT_AUTO_PREFERRED", "transformers").strip().lower()
+    return preferred if preferred in {"transformers", "marian", "nllb", "mock"} else "transformers"
+
+
+def _configured_translation_provider() -> str:
+    provider = os.getenv("TRANSLATION_PROVIDER", "oss").strip().lower()
+    return provider if provider in TRANSLATION_PROVIDER_VALUES else "oss"
+
+
+def _qa_ab_percent() -> int:
+    try:
+        raw_percent = int(os.getenv("QA_AB_PERCENT", "0"))
+    except ValueError:
+        return 0
+    return max(0, min(100, raw_percent))
+
+
+def _stable_ab_bucket(session_id: str) -> int:
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 100
+
+
+def _select_translation_provider(session_id: str) -> tuple[str, int, bool, int]:
+    provider = _configured_translation_provider()
+    bucket = _stable_ab_bucket(session_id)
+    percent = _qa_ab_percent()
+    if provider != "ab":
+        return provider, bucket, False, percent
+    selected = "gemini" if bucket < percent else "oss"
+    return selected, bucket, percent > 0, percent
+
+
+def _capability_response(capability: BackendCapabilities) -> BackendCapabilityResponse:
+    return BackendCapabilityResponse(
+        name=capability.name,
+        streaming=capability.streaming,
+        partial_results=capability.partial_results,
+        supported_languages=capability.supported_languages,
+        supported_pairs=capability.supported_pairs,
+        requires_ml_dependencies=capability.requires_ml_dependencies,
+        notes=capability.notes,
+    )
+
+
+def _available_asr_capabilities() -> list[BackendCapabilityResponse]:
+    from .backends import FasterWhisperASRBackend, VoskASRBackend
+
+    return [
+        _capability_response(MockASRBackend.capabilities),
+        _capability_response(VoskASRBackend.capabilities),
+        _capability_response(FasterWhisperASRBackend.capabilities),
+    ]
+
+
+def _available_mt_capabilities() -> list[BackendCapabilityResponse]:
+    from .backends import TransformersMTBackend
+
+    return [
+        _capability_response(MockMTBackend.capabilities),
+        _capability_response(TransformersMTBackend.capabilities),
+    ]
+
+
+def build_asr_backend() -> ASRBackend:
+    backend = os.getenv("ASR_BACKEND", "mock").lower()
+    if backend == "auto":
+        backend = _choose_auto_asr_backend()
+        logger.info("ASR auto-selected backend: %s", backend)
+    if backend == "streaming":
+        backend = "vosk"
+    elif backend == "quality":
+        backend = "faster-whisper"
+    if backend == "mock":
+        return MockASRBackend()
+    if backend == "vosk":
+        from .backends import VoskASRBackend
+        return VoskASRBackend()
+    if backend == "faster-whisper":
+        from .backends import FasterWhisperASRBackend
+        return FasterWhisperASRBackend()
+    raise ValueError(f"Unsupported ASR backend: {backend}")
+
+
+def build_mt_backend() -> MTBackend:
+    backend = os.getenv("MT_BACKEND", "mock").lower()
+    if backend == "auto":
+        backend = _choose_auto_mt_backend()
+        logger.info("MT auto-selected backend: %s", backend)
+    if backend == "mock":
+        return MockMTBackend()
+    if backend in {"transformers", "marian", "nllb"}:
+        from .backends import TransformersMTBackend
+        return TransformersMTBackend()
+    raise ValueError(f"Unsupported MT backend: {backend}")
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def metrics() -> PlainTextResponse:
+    return PlainTextResponse(_build_prometheus_metrics())
+
+
+@app.get("/api/ops/model-recommendation", response_model=ModelRecommendationResponse)
+async def model_recommendation() -> ModelRecommendationResponse:
+    cpu_ops = _cpu_ops_per_ms()
+    gpu_hint = _gpu_hint_available()
+    asr_backend = "faster-whisper" if gpu_hint else (
+        "faster-whisper"
+        if cpu_ops >= int(os.getenv("ASR_AUTO_QUALITY_CPU_THRESHOLD_OPS_MS", "8500"))
+        else "vosk"
+    )
+    mt_backend = _choose_auto_mt_backend()
+    return ModelRecommendationResponse(
+        asr_backend=asr_backend,
+        mt_backend=mt_backend,
+        cpu_ops_per_ms=cpu_ops,
+        gpu_hint=gpu_hint,
+        threshold_dropped_hypothesis_rate_pct=float(
+            os.getenv("SLO_DROPPED_HYPOTHESIS_RATE_PCT", "25")
+        ),
+    )
+
+
+@app.get("/api/ops/backend-capabilities", response_model=BackendCapabilitiesResponse)
+async def backend_capabilities() -> BackendCapabilitiesResponse:
+    provider = _configured_translation_provider()
+    return BackendCapabilitiesResponse(
+        asr_backends=_available_asr_capabilities(),
+        mt_backends=_available_mt_capabilities(),
+        active_asr_backend=os.getenv("ASR_BACKEND", "mock").strip().lower(),
+        active_mt_backend=os.getenv("MT_BACKEND", "mock").strip().lower(),
+        translation_provider=provider,
+        qa_ab_enabled=provider == "ab" and _qa_ab_percent() > 0,
+        qa_ab_percent=_qa_ab_percent(),
+    )
+
+
+@app.post("/api/ops/provider-selection", response_model=ProviderSelectionResponse)
+async def provider_selection(payload: ProviderSelectionRequest) -> ProviderSelectionResponse:
+    session_id = payload.session_id.strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+    provider, bucket, enabled, percent = _select_translation_provider(session_id)
+    return ProviderSelectionResponse(
+        provider=provider,
+        ab_bucket=bucket,
+        qa_ab_enabled=enabled,
+        qa_ab_percent=percent,
+    )
+
+
+@app.post("/api/auth/session", response_model=SessionCreateResponse)
+async def create_session(payload: SessionCreateRequest, request: Request) -> SessionCreateResponse:
+    _enforce_rate_limit(
+        "auth_session",
+        _request_identity(request),
+        RATE_LIMIT_AUTH_SESSION_PER_WINDOW,
+    )
+    now = int(time.time())
+    exp = now + SESSION_TTL_SECONDS
+    user_id = uuid.uuid4().hex
+    role = payload.role.strip().lower()
+    if role not in {"agent", "investor"}:
+        raise HTTPException(status_code=400, detail="invalid role")
+
+    session_payload = {
+        "user_id": user_id,
+        "display_name": payload.display_name.strip()[:80],
+        "role": role,
+        "iat": now,
+        "exp": exp,
+    }
+    token = _sign_payload(session_payload)
+    _append_audit_event(
+        "session_created",
+        {"user_id": user_id, "role": role, "display_name": session_payload["display_name"]},
+    )
+    return SessionCreateResponse(token=token, user_id=user_id, expires_at=exp)
+
+
+@app.post("/api/auth/validate")
+async def validate_session(payload: SessionValidateRequest) -> dict[str, Any]:
+    session = _validate_token(payload.token)
+    return {
+        "valid": True,
+        "user_id": session["user_id"],
+        "display_name": session["display_name"],
+        "role": session["role"],
+        "expires_at": session["exp"],
+    }
+
+
+@app.post("/api/gemini/live-token", response_model=GeminiLiveTokenResponse)
+async def create_gemini_live_token(
+    payload: GeminiLiveTokenRequest,
+) -> GeminiLiveTokenResponse:
+    session = _validate_token(payload.token)
+    _enforce_rate_limit(
+        "gemini_live_token",
+        session["user_id"],
+        RATE_LIMIT_GEMINI_TOKEN_PER_WINDOW,
+    )
+    if not GEMINI_API_KEY:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured")
+
+    target_language = payload.target_language_code.strip() or "es"
+    try:
+        data = await asyncio.to_thread(_create_gemini_live_token_with_sdk, target_language)
+        token = data.get("name") or data.get("token")
+        if not token:
+            raise HTTPException(status_code=502, detail="Gemini token response missing token")
+        return GeminiLiveTokenResponse(token=token, expire_time=data.get("expireTime"))
+    except ModuleNotFoundError:
+        logger.warning("google-genai is not installed; falling back to direct REST token request")
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception("Gemini SDK token request failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini SDK token request failed: {_safe_exception_message(error)}",
+        ) from error
+
+    now = int(time.time())
+    token_payload = {
+        "uses": 1,
+        "expire_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 30 * 60)),
+        "new_session_expire_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 60)),
+        "live_connect_constraints": {
+            "model": GEMINI_LIVE_TRANSLATE_MODEL,
+            "config": {
+                "response_modalities": ["AUDIO"],
+                "input_audio_transcription": {},
+                "output_audio_transcription": {},
+                "translation_config": {
+                    "target_language_code": target_language,
+                    "echo_target_language": True,
+                },
+            },
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                GEMINI_AUTH_TOKENS_URL,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": GEMINI_API_KEY,
+                },
+                json=token_payload,
+            )
+    except httpx.HTTPError as error:
+        logger.exception("Gemini ephemeral token request failed")
+        raise HTTPException(status_code=502, detail="Gemini token service unavailable") from error
+
+    if response.status_code >= 400:
+        logger.warning("Gemini token service returned %s: %s", response.status_code, response.text)
+        raise HTTPException(status_code=502, detail=_gemini_error_detail(response))
+
+    data = response.json()
+    token = data.get("name") or data.get("token")
+    if not token:
+        raise HTTPException(status_code=502, detail="Gemini token response missing token")
+    return GeminiLiveTokenResponse(token=token, expire_time=data.get("expireTime"))
+
+
+@app.post("/api/chat/translate", response_model=ChatTranslateResponse)
+async def translate_chat(payload: ChatTranslateRequest, request: Request) -> ChatTranslateResponse:
+    session = _validate_token(payload.token)
+    _enforce_rate_limit(
+        "chat_translate",
+        session["user_id"],
+        RATE_LIMIT_CHAT_TRANSLATE_PER_WINDOW,
+    )
+    usage = _usage_bucket(session["user_id"])
+    next_chars = usage["translated_chars"] + len(payload.text)
+    if next_chars > MAX_TRANSLATION_CHARS_PER_SESSION:
+        raise HTTPException(status_code=429, detail="session translation quota exceeded")
+    mt_backend = build_mt_backend()
+    translated = _translate_with_cache(
+        mt_backend, payload.text, payload.source_lang, payload.target_lang
+    )
+    usage["translated_chars"] = next_chars
+    _append_audit_event(
+        "translation_usage",
+        {
+            "user_id": session["user_id"],
+            "translated_chars": usage["translated_chars"],
+            "translated_limit": MAX_TRANSLATION_CHARS_PER_SESSION,
+        },
+    )
+    return ChatTranslateResponse(translated_text=translated)
+
+
+@app.post("/api/chat/tts", response_model=ChatTTSResponse)
+async def tts_chat(payload: ChatTTSRequest, request: Request) -> ChatTTSResponse:
+    session = _validate_token(payload.token)
+    _enforce_rate_limit("chat_tts", session["user_id"], RATE_LIMIT_CHAT_TTS_PER_WINDOW)
+    usage = _usage_bucket(session["user_id"])
+    next_chars = usage["tts_chars"] + len(payload.text)
+    if next_chars > MAX_TTS_CHARS_PER_SESSION:
+        raise HTTPException(status_code=429, detail="session tts quota exceeded")
+
+    mt_backend = build_mt_backend()
+    translated = _translate_with_cache(
+        mt_backend, payload.text, payload.source_lang, payload.target_lang
+    )
+    usage["tts_chars"] = next_chars
+    _append_audit_event(
+        "tts_usage",
+        {
+            "user_id": session["user_id"],
+            "tts_chars": usage["tts_chars"],
+            "tts_limit": MAX_TTS_CHARS_PER_SESSION,
+        },
+    )
+    return ChatTTSResponse(text_to_speak=translated, voice_lang=payload.target_lang or "en")
+
+
+@app.post("/api/sessions/usage", response_model=SessionUsageResponse)
+async def session_usage(payload: SessionUsageRequest) -> SessionUsageResponse:
+    session = _validate_token(payload.token)
+    usage = _usage_bucket(session["user_id"])
+    return SessionUsageResponse(
+        translated_chars=usage["translated_chars"],
+        tts_chars=usage["tts_chars"],
+        translated_limit=MAX_TRANSLATION_CHARS_PER_SESSION,
+        tts_limit=MAX_TTS_CHARS_PER_SESSION,
+    )
+
+
+@app.post("/api/sessions/cost", response_model=SessionCostResponse)
+async def session_cost(payload: SessionCostRequest) -> SessionCostResponse:
+    session = _validate_token(payload.token)
+    usage = _usage_bucket(session["user_id"])
+    translation_cost = usage["translated_chars"] * COST_PER_TRANSLATED_CHAR_EUR
+    tts_cost = usage["tts_chars"] * COST_PER_TTS_CHAR_EUR
+    total_cost = translation_cost + tts_cost
+    return SessionCostResponse(
+        translated_chars=usage["translated_chars"],
+        tts_chars=usage["tts_chars"],
+        estimated_translation_cost_eur=round(translation_cost, 6),
+        estimated_tts_cost_eur=round(tts_cost, 6),
+        estimated_total_cost_eur=round(total_cost, 6),
+    )
+
+
+@app.post("/api/sessions/cost-dashboard", response_model=SessionCostDashboardResponse)
+async def session_cost_dashboard(
+    payload: SessionCostDashboardRequest,
+) -> SessionCostDashboardResponse:
+    session = _validate_token(payload.token)
+    bucket = _telemetry_bucket(session["user_id"])
+    call_events = [
+        event for event in bucket if event.get("type") == "call_ended" and event.get("call_id")
+    ]
+    ordered = sorted(call_events, key=lambda event: int(event.get("timestamp_ms", 0)), reverse=True)
+
+    items: list[SessionCostDashboardItem] = []
+    total_cost = 0.0
+    for event in ordered:
+        payload_data = event.get("payload", {})
+        estimated_cost = payload_data.get("session_cost_estimated_eur")
+        if not isinstance(estimated_cost, (int, float)):
+            continue
+        total_cost += float(estimated_cost)
+        latency_raw = payload_data.get("latency_ms")
+        bitrate_raw = payload_data.get("bitrate_kbps")
+        packet_loss_raw = payload_data.get("packet_loss_pct")
+        items.append(
+            SessionCostDashboardItem(
+                call_id=str(event.get("call_id")),
+                timestamp_ms=int(event.get("timestamp_ms", 0)),
+                estimated_total_cost_eur=round(float(estimated_cost), 6),
+                bitrate_kbps=int(bitrate_raw)
+                if isinstance(bitrate_raw, (int, float)) and bitrate_raw >= 0
+                else None,
+                packet_loss_pct=round(float(packet_loss_raw), 2)
+                if isinstance(packet_loss_raw, (int, float)) and packet_loss_raw >= 0
+                else None,
+                latency_ms=int(latency_raw)
+                if isinstance(latency_raw, (int, float)) and latency_raw >= 0
+                else None,
+            )
+        )
+
+    limited = items[: max(1, min(payload.limit, 50))]
+    calls_count = len(items)
+    return SessionCostDashboardResponse(
+        total_calls=calls_count,
+        total_estimated_cost_eur=round(total_cost, 6),
+        average_cost_per_call_eur=round(total_cost / calls_count, 6) if calls_count else 0.0,
+        recent_calls=limited,
+    )
+
+
+@app.post("/api/rooms/register", response_model=RoomRegisterResponse)
+async def register_room(payload: RoomRegisterRequest) -> RoomRegisterResponse:
+    session = _validate_token(payload.token)
+    _enforce_rate_limit("rooms", session["user_id"], RATE_LIMIT_ROOMS_PER_WINDOW)
+    room_code = _normalize_room_code(payload.room_code)
+    if len(room_code) < 4:
+        raise HTTPException(status_code=400, detail="room code too short")
+
+    participants = _upsert_room_presence(
+        room_code=room_code,
+        peer_id=payload.peer_id,
+        user_id=session["user_id"],
+        display_name=session["display_name"],
+    )
+    _append_audit_event(
+        "room_registered",
+        {
+            "room_code": room_code,
+            "peer_id": payload.peer_id,
+            "user_id": session["user_id"],
+            "participants": participants,
+        },
+    )
+    return RoomRegisterResponse(status="ok", room_code=room_code, participants=participants)
+
+
+@app.post("/api/rooms/resolve", response_model=RoomResolveResponse)
+async def resolve_room(payload: RoomResolveRequest) -> RoomResolveResponse:
+    session = _validate_token(payload.token)
+    _enforce_rate_limit("rooms", session["user_id"], RATE_LIMIT_ROOMS_PER_WINDOW)
+    room_code = _normalize_room_code(payload.room_code)
+    return _resolve_room_participants(room_code, payload.requester_peer_id)
+
+
+@app.post(
+    "/api/integrations/bot/session",
+    response_model=BotIntegrationSessionResponse,
+)
+async def create_bot_integration_session(
+    payload: BotIntegrationSessionRequest,
+    request: Request,
+) -> BotIntegrationSessionResponse:
+    session = _validate_token(payload.token)
+    _enforce_rate_limit("bot_session", session["user_id"], RATE_LIMIT_ROOMS_PER_WINDOW)
+
+    provider = payload.provider.strip().lower()[:40]
+    external_meeting_id = payload.external_meeting_id.strip()[:120]
+    if not provider or not external_meeting_id:
+        raise HTTPException(status_code=400, detail="provider and external_meeting_id are required")
+
+    now = int(time.time())
+    exp = now + min(SESSION_TTL_SECONDS, 3600)
+    bot_payload = {
+        "kind": "bot-integration",
+        "owner_user_id": session["user_id"],
+        "provider": provider,
+        "external_meeting_id": external_meeting_id,
+        "bot_display_name": payload.bot_display_name.strip()[:80] or "Anclora Linguo Bot",
+        "iat": now,
+        "exp": exp,
+    }
+    bot_token = _sign_payload(bot_payload)
+    ingest_scheme = "wss" if request.url.scheme == "https" else "ws"
+    ingest_ws_url = f"{ingest_scheme}://{request.url.netloc}/ws/asr-mt"
+
+    _append_audit_event(
+        "bot_integration_session_created",
+        {
+            "owner_user_id": session["user_id"],
+            "provider": provider,
+            "external_meeting_id": external_meeting_id,
+            "expires_at": exp,
+        },
+    )
+    return BotIntegrationSessionResponse(
+        status="ok",
+        provider=provider,
+        external_meeting_id=external_meeting_id,
+        bot_token=bot_token,
+        ingest_ws_url=ingest_ws_url,
+        expires_at=exp,
+    )
+
+
+@app.get("/api/rooms/subscribe")
+async def subscribe_room(
+    request: Request,
+    token: str,
+    room_code: str,
+    requester_peer_id: str,
+) -> StreamingResponse:
+    _validate_token(token)
+    normalized_room = _normalize_room_code(room_code)
+
+    async def event_stream():
+        started_at = time.time()
+        yield "event: ready\ndata: {}\n\n"
+        while True:
+            if await request.is_disconnected():
+                break
+
+            resolved = _resolve_room_participants(normalized_room, requester_peer_id)
+            if resolved.target_peer_id and resolved.initiator_peer_id:
+                payload = {
+                    "status": "paired",
+                    "room_code": resolved.room_code,
+                    "participants": resolved.participants,
+                    "target_peer_id": resolved.target_peer_id,
+                    "initiator_peer_id": resolved.initiator_peer_id,
+                }
+                yield f"event: paired\ndata: {json.dumps(payload, ensure_ascii=True)}\n\n"
+                break
+
+            if (time.time() - started_at) >= 25:
+                payload = {"status": "timeout", "room_code": normalized_room}
+                yield f"event: timeout\ndata: {json.dumps(payload, ensure_ascii=True)}\n\n"
+                break
+
+            yield "event: waiting\ndata: {}\n\n"
+            await asyncio.sleep(0.25)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.post("/api/telemetry/events", response_model=TelemetryBatchResponse)
+async def ingest_telemetry(payload: TelemetryBatchRequest) -> TelemetryBatchResponse:
+    session = _validate_token(payload.token)
+    _enforce_rate_limit(
+        "telemetry",
+        session["user_id"],
+        RATE_LIMIT_TELEMETRY_PER_WINDOW,
+    )
+    accepted = 0
+    for event in payload.events:
+        accepted_event = _append_telemetry_event(
+            user_id=session["user_id"],
+            call_id=payload.call_id,
+            event_type=event.type,
+            timestamp_ms=event.timestamp_ms,
+            schema_version=event.schema_version,
+            payload=event.payload,
+        )
+        if not accepted_event:
+            break
+        accepted += 1
+        _append_audit_event(
+            "telemetry_event",
+            {
+                "user_id": session["user_id"],
+                "call_id": payload.call_id,
+                "event_type": event.type,
+            },
+        )
+    return TelemetryBatchResponse(
+        status="ok",
+        accepted_events=accepted,
+        total_events_in_session=len(_telemetry_bucket(session["user_id"])),
+    )
+
+
+@app.post("/api/telemetry/summary", response_model=TelemetrySummaryResponse)
+async def telemetry_summary(payload: TelemetrySummaryRequest) -> TelemetrySummaryResponse:
+    session = _validate_token(payload.token)
+    bucket = _telemetry_bucket(session["user_id"])
+    return _build_telemetry_summary(bucket)
+
+
+@app.post("/api/telemetry/slo", response_model=TelemetrySLOResponse)
+async def telemetry_slo(payload: TelemetrySLORequest) -> TelemetrySLOResponse:
+    session = _validate_token(payload.token)
+    summary = _build_telemetry_summary(_telemetry_bucket(session["user_id"]))
+
+    ttfc_p50_threshold = int(os.getenv("SLO_TTFC_MS_P50", "700"))
+    ttfc_p95_threshold = int(os.getenv("SLO_TTFC_MS_P95", "1500"))
+    lag_p95_threshold = int(os.getenv("SLO_CAPTION_LAG_MS_P95", "1800"))
+    dropped_threshold = float(os.getenv("SLO_DROPPED_HYPOTHESIS_RATE_PCT", "25"))
+
+    checks = []
+    if summary.ttfc_ms_p50 is not None:
+        checks.append(summary.ttfc_ms_p50 <= ttfc_p50_threshold)
+    if summary.ttfc_ms_p95 is not None:
+        checks.append(summary.ttfc_ms_p95 <= ttfc_p95_threshold)
+    if summary.caption_lag_ms_p95 is not None:
+        checks.append(summary.caption_lag_ms_p95 <= lag_p95_threshold)
+    if summary.dropped_hypothesis_rate_pct_avg is not None:
+        checks.append(summary.dropped_hypothesis_rate_pct_avg <= dropped_threshold)
+
+    return TelemetrySLOResponse(
+        pass_slo=all(checks) if checks else False,
+        ttfc_ms_p50=summary.ttfc_ms_p50,
+        ttfc_ms_p95=summary.ttfc_ms_p95,
+        caption_lag_ms_p95=summary.caption_lag_ms_p95,
+        dropped_hypothesis_rate_pct_avg=summary.dropped_hypothesis_rate_pct_avg,
+        threshold_ttfc_ms_p50=ttfc_p50_threshold,
+        threshold_ttfc_ms_p95=ttfc_p95_threshold,
+        threshold_caption_lag_ms_p95=lag_p95_threshold,
+        threshold_dropped_hypothesis_rate_pct=dropped_threshold,
+    )
+
+
+@app.post("/api/sessions/consent", response_model=ConsentEventResponse)
+async def register_consent(payload: ConsentEventRequest) -> ConsentEventResponse:
+    session = _validate_token(payload.token)
+    consent_id = uuid.uuid4().hex
+    _append_audit_event(
+        "recording_consent",
+        {
+            "consent_id": consent_id,
+            "call_id": payload.call_id,
+            "consent_recording": payload.consent_recording,
+            "user_id": session["user_id"],
+            "role": session["role"],
+        },
+    )
+    return ConsentEventResponse(status="ok", consent_id=consent_id)
+
+
+@app.websocket("/ws/asr-mt")
+async def ws_asr_mt(websocket: WebSocket) -> None:
+    token = websocket.query_params.get("token", "")
+    try:
+        _validate_token(token)
+    except HTTPException:
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+    asr_backend = build_asr_backend()
+    mt_backend = build_mt_backend()
+    session_config: Optional[SessionConfig] = None
+    ws_identity = _websocket_identity(websocket)
+    pending_partials: list[str] = []
+    first_pending_partial_ts_ms: Optional[int] = None
+    pending_chars = 0
+
+    async def flush_pending_partials(force: bool = False) -> None:
+        nonlocal pending_partials, first_pending_partial_ts_ms, pending_chars
+        if not session_config or not pending_partials:
+            return
+        now_ms = int(time.time() * 1000)
+        age_ms = (
+            now_ms - first_pending_partial_ts_ms
+            if first_pending_partial_ts_ms is not None
+            else 0
+        )
+        if not force and MT_MICRO_BATCH_WINDOW_MS > 0 and age_ms < MT_MICRO_BATCH_WINDOW_MS:
+            return
+
+        translated_batch = _translate_with_cache_many(
+            mt_backend,
+            pending_partials,
+            session_config.source_lang,
+            session_config.target_lang,
+        )
+        for original_text, translated_text in zip(pending_partials, translated_batch):
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "partial",
+                        "text": original_text,
+                        "translated_text": translated_text,
+                        "timestamp_ms": int(time.time() * 1000),
+                    }
+                )
+            )
+
+        pending_partials = []
+        first_pending_partial_ts_ms = None
+        pending_chars = 0
+
+    try:
+        while True:
+            if _is_rate_limited("ws_messages", ws_identity, RATE_LIMIT_WS_MESSAGES_PER_WINDOW):
+                await websocket.send_text(
+                    json.dumps({"type": "error", "message": "rate limit exceeded"})
+                )
+                await websocket.close(code=1013)
+                return
+            message = await websocket.receive()
+            if message.get("type") == "websocket.disconnect":
+                raise WebSocketDisconnect
+
+            if "text" in message:
+                await flush_pending_partials(force=True)
+                await handle_text_message(
+                    websocket, message["text"], asr_backend, mt_backend, lambda: session_config
+                )
+                if session_config is None and message["text"]:
+                    try:
+                        parsed = ConfigMessage.model_validate_json(message["text"])
+                        session_config = SessionConfig(
+                            session_id=parsed.session_id,
+                            source_lang=parsed.source_lang,
+                            target_lang=parsed.target_lang,
+                            sample_rate=parsed.sample_rate,
+                            format=parsed.format,
+                        )
+                        asr_backend.start(session_config)
+                        logger.info("Session %s started", session_config.session_id)
+                    except ValidationError:
+                        pass
+                continue
+
+            if "bytes" in message:
+                if session_config is None:
+                    await websocket.send_text(json.dumps({"type": "error", "message": "missing config"}))
+                    continue
+                audio_bytes = message["bytes"]
+                partial = asr_backend.transcribe_chunk(audio_bytes)
+                if partial:
+                    pending_partials.append(partial)
+                    pending_chars += len(partial)
+                    if first_pending_partial_ts_ms is None:
+                        first_pending_partial_ts_ms = int(time.time() * 1000)
+                    if (
+                        MT_MICRO_BATCH_WINDOW_MS <= 0
+                        or len(pending_partials) >= MT_MICRO_BATCH_MAX_ITEMS
+                        or pending_chars >= MT_MICRO_BATCH_MAX_CHARS
+                    ):
+                        await flush_pending_partials(force=True)
+                    else:
+                        await flush_pending_partials(force=False)
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+
+
+async def handle_text_message(
+    websocket: WebSocket,
+    text: str,
+    asr_backend: ASRBackend,
+    mt_backend: MTBackend,
+    config_provider,
+) -> None:
+    if not text:
+        return
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        await websocket.send_text(json.dumps({"type": "error", "message": "invalid json"}))
+        return
+
+    msg_type = payload.get("type")
+    if msg_type == "config":
+        await websocket.send_text(json.dumps({"type": "ok", "message": "config received"}))
+        return
+    if msg_type == "segment_end":
+        final = asr_backend.finalize()
+        session_config = config_provider()
+        if final and session_config:
+            translated = _translate_with_cache(
+                mt_backend,
+                final, session_config.source_lang, session_config.target_lang
+            )
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "final",
+                        "text": final,
+                        "translated_text": translated,
+                        "timestamp_ms": int(time.time() * 1000),
+                    }
+                )
+            )
+        return
+    if msg_type == "end":
+        final = asr_backend.finalize()
+        session_config = config_provider()
+        if final and session_config:
+            translated = _translate_with_cache(
+                mt_backend,
+                final, session_config.source_lang, session_config.target_lang
+            )
+            await websocket.send_text(
+                json.dumps(
+                    {
+                        "type": "final",
+                        "text": final,
+                        "translated_text": translated,
+                        "timestamp_ms": int(time.time() * 1000),
+                    }
+                )
+            )
+        await websocket.close()
+        return
+
+    await websocket.send_text(json.dumps({"type": "error", "message": "unknown message"}))

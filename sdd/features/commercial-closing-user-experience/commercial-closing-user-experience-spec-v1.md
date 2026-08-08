@@ -1,0 +1,59 @@
+# SPEC — commercial-closing-user-experience (v1)
+
+## 0. Meta
+- Feature: commercial-closing-user-experience
+- Version: v1
+- Estado: implemented
+
+## 1. Objetivo
+Reducir friccion de acceso a llamada para perfiles no tecnicos usando salas por enlace y validacion previa de dispositivos/red.
+
+## 2. Alcance
+- Incluye:
+  - flujo de sala por codigo/enlace,
+  - registro y resolucion de participantes en backend,
+  - pre-call check de camara, microfono, red, backend e ICE/WebRTC,
+  - transcript ligero con etiquetas de speaker y export VTT/SRT,
+  - ajuste de privacidad/UX para ocultar hipotesis y mostrar solo texto confirmado,
+  - flujo de llamada iniciada automaticamente por el participante iniciador de sala.
+- No incluye:
+  - persistencia de salas en base de datos,
+  - invitaciones por email/whatsapp automaticas.
+
+## 3. Cambios backend
+- `services/asr-mt/app/main.py`
+  - `GET /health`
+  - `POST /api/rooms/register`
+  - `POST /api/rooms/resolve`
+  - `GET /api/rooms/subscribe` (SSE para emparejamiento push),
+  - TTL de participantes en sala por `ROOM_PARTICIPANT_TTL_SECONDS`.
+
+## 4. Cambios frontend
+- `App.tsx`
+  - soporte `?room=` en URL.
+  - registro + suscripcion SSE de sala (`/api/rooms/subscribe`) con fallback a polling.
+  - polling de fallback con backoff progresivo (200ms -> 500ms -> 1000ms).
+  - determinacion de iniciador para evitar doble marcado.
+  - telemetria `room_pair_resolved` con `time_to_pair_ms`.
+  - pre-check extendido con:
+    - latencia promedio de backend (`/health`, 3 muestras),
+    - benchmark CPU corto en cliente (`ops/ms`),
+    - snapshot de red WebRTC (`rtt/jitter/loss`) en telemetria,
+    - probe ICE/datachannel loopback para detectar conectividad WebRTC real y uso de relay TURN.
+- `components/CallSetup.tsx`
+  - boton copiar enlace de invitacion.
+  - boton pre-check y estado inline.
+- `components/ChatSidebar.tsx`
+  - controles de export transcript (`VTT`/`SRT`) y estado habilitado/deshabilitado.
+  - panel de transcripcion completo con busqueda y copia.
+- `components/SettingsModal.tsx` + `components/VideoGrid.tsx`
+  - toggle `Caption Preview` persistido para mostrar/ocultar hipotesis.
+
+## 5. Criterios de aceptacion
+- [x] No se requiere intercambio manual de Peer ID para conectar.
+- [x] Existe enlace compartible de sala.
+- [x] Existe pre-check operativo previo a llamada.
+- [x] Existe export de transcript etiquetado por speaker.
+- [x] Existe panel de transcripcion con filtro de busqueda y boton copiar.
+- [x] Usuario puede ocultar hipotesis de subtitulos (solo commits).
+- [x] `npm run lint` y `npm run build` en verde.

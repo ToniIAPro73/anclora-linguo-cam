@@ -1,0 +1,42 @@
+{
+  "name": "linguocam---real-time-translingual-chat",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "test:e2e": "playwright test",
+    "test:e2e:network": "E2E_NETWORK_PROFILE=true playwright test e2e/call-captions-network.e2e.ts --workers=1 --retries=2"
+  },
+  "dependencies": {
+    "@fontsource-variable/inter": "^5.2.8",
+    "@fortawesome/fontawesome-free": "^7.2.0",
+    "@google/genai": "^2.13.0",
+    "peerjs": "^1.5.5",
+    "react": "^19.2.3",
+    "react-dom": "^19.2.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.19.0",
+    "@playwright/test": "^1.53.2",
+    "@tailwindcss/vite": "^4.3.1",
+    "@types/node": "^22.14.0",
+    "@typescript-eslint/eslint-plugin": "^8.22.0",
+    "@typescript-eslint/parser": "^8.22.0",
+    "@vitejs/plugin-react": "^6.0.2",
+    "eslint": "^9.19.0",
+    "eslint-plugin-react": "^7.37.4",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "eslint-plugin-react-refresh": "^0.4.18",
+    "globals": "^15.14.0",
+    "tailwindcss": "^4.3.1",
+    "typescript": "~5.8.2",
+    "vite": "^8.0.16",
+    "vitest": "^4.1.8"
+  }
+}

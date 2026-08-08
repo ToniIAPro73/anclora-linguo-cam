@@ -1,0 +1,45 @@
+# Test Plan — commercial-closing-user-experience (v1)
+
+## Suite minima obligatoria
+- npm run lint
+- npm run build
+- Prueba manual de llamada 1:1 (audio, video, subtitulos, chat, colgar)
+
+## Casos funcionales
+1. Enlace de sala
+- Usuario A copia enlace de sala.
+- Usuario B abre enlace (`?room=`) y se precarga sala.
+
+2. Resolucion de participantes
+- Ambos usuarios pulsan iniciar llamada.
+- El iniciador marca y el otro recibe llamada.
+- Validar `time_to_pair_ms` y `attempts` en evento `room_pair_resolved`.
+- Validar `transport` en telemetria (`sse` o `polling` fallback).
+
+3. Pre-check
+- Pulsar pre-check antes de llamar.
+- Mostrar resultado inline OK/error.
+- Verificar que `precheck_result` incluye `backend_latency_ms` y `cpu_ops_per_ms`.
+
+4. Pre-check ICE/WebRTC
+- Ejecutar pre-check en 2 redes (normal y restrictiva).
+- Verificar que `precheck_result` incluye `ice_ok`, `precheck_rtt_ms` y `turn_relay`.
+
+5. Export transcript VTT/SRT
+- Durante llamada, generar subtitulos finales de ambos participantes.
+- Exportar VTT y SRT desde chat sidebar.
+- Verificar etiquetas de speaker y timestamps en ambos archivos.
+
+6. Toggle de hipotesis
+- Abrir `Settings` y desactivar `Caption Preview`.
+- Verificar que en `VideoGrid` solo se renderiza texto confirmado.
+
+7. Panel transcript completo
+- Abrir pestaña `Transcript` en sidebar.
+- Buscar por texto y copiar transcript.
+- Verificar que filtro y copia funcionan sobre entradas de ambos speakers.
+
+## Resultado actual
+- lint: PASS
+- build: PASS
+- validacion manual 2 navegadores: PENDIENTE

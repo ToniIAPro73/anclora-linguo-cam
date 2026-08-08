@@ -1,0 +1,9 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "ml: optional tests that require real machine-learning models",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
