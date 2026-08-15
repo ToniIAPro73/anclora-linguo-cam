@@ -1,6 +1,7 @@
 import { PeerServer } from "peer";
 
 const port = Number(process.env.PEER_PORT || 9000);
+const host = process.env.PEER_HOST || "127.0.0.1";
 const path = process.env.PEER_PATH || "/peerjs";
 const key = process.env.PEER_KEY || "peerjs";
 const allowDiscovery = (process.env.PEER_ALLOW_DISCOVERY || "false") === "true";
@@ -13,6 +14,7 @@ const allowedOrigins = (process.env.PEER_ALLOWED_ORIGINS || "")
   .filter(Boolean);
 
 const server = PeerServer({
+  host,
   port,
   path,
   key,
@@ -43,5 +45,5 @@ const shutdown = (signal) => {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
-console.log(`PeerJS server listening on :${port}${path}`);
+console.log(`PeerJS server listening on ${host}:${port}${path}`);
 console.log(`PeerJS discovery=${allowDiscovery} proxied=${proxied} alive_timeout=${aliveTimeout} concurrent_limit=${concurrentLimit}`);

@@ -12,7 +12,10 @@ export ASR_BACKEND="${ASR_BACKEND:-mock}"
 export MT_BACKEND="${MT_BACKEND:-mock}"
 export STORAGE_BACKEND="${STORAGE_BACKEND:-sqlite}"
 export SQLITE_DB_PATH="${SQLITE_DB_PATH:-$BACKEND_DIR/runtime/asr-mt.sqlite3}"
-export PEER_PORT="${PEER_PORT:-9000}"
+export ASR_MT_HOST="${ASR_MT_HOST:-127.0.0.1}"
+export ASR_MT_PORT="${ASR_MT_PORT:-3021}"
+export PEER_HOST="${PEER_HOST:-127.0.0.1}"
+export PEER_PORT="${PEER_PORT:-3022}"
 export PEER_PATH="${PEER_PATH:-/peerjs}"
 export PEER_ALLOWED_ORIGINS="${PEER_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173}"
 
@@ -36,7 +39,7 @@ trap cleanup EXIT INT TERM
     # shellcheck disable=SC1091
     . ".venv/bin/activate"
   fi
-  uvicorn app.main:app --host 0.0.0.0 --port "${ASR_MT_PORT:-8001}"
+  uvicorn app.main:app --host "$ASR_MT_HOST" --port "$ASR_MT_PORT"
 ) &
 
 (
