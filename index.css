@@ -1,5 +1,8 @@
 @import "tailwindcss";
 
+/* Compact density for short windows (e.g. DevTools responsive ~625px tall). */
+@custom-variant short (@media (max-height: 700px));
+
 @theme inline {
   --color-background: var(--background);
   --color-surface: var(--surface);

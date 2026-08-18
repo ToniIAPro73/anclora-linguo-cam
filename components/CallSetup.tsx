@@ -72,18 +72,18 @@ const CallSetup: React.FC<CallSetupProps> = ({
   const isConnecting = status === CallStatus.CONNECTING;
   return (
     <div className="h-full min-h-0 bg-background px-3 sm:px-5 overflow-hidden">
-      <div className="h-full min-h-0 flex items-center justify-center overflow-y-auto py-3 sm:py-4">
-        <div className="w-full max-w-130 space-y-2 sm:space-y-3 max-[820px]:space-y-2 animate-in fade-in duration-700">
+      <div className="h-full min-h-0 flex overflow-y-auto py-3 sm:py-4 short:py-2">
+        <div className="m-auto w-full max-w-130 space-y-2 sm:space-y-3 max-[820px]:space-y-2 animate-in fade-in duration-700">
           <div
             data-testid="setup-card"
-            className="glass-panel rounded-2xl sm:rounded-3xl p-4 max-[820px]:p-3 space-y-2 max-[820px]:space-y-2"
+            className="glass-panel rounded-2xl sm:rounded-3xl p-4 max-[820px]:p-3 short:p-3 space-y-2 max-[820px]:space-y-2 short:space-y-1.5"
           >
-            <div className="space-y-2 max-[820px]:space-y-1.5">
-              <div className="flex flex-col gap-1.5">
+            <div className="space-y-2 max-[820px]:space-y-1.5 short:space-y-1.5">
+              <div className="flex flex-col gap-1.5 short:gap-1">
                 <label className="text-[10px] sm:text-xs font-bold uppercase text-text-muted tracking-widest px-1">
                   {uiText.yourPeerId}
                 </label>
-                <div className="rounded-xl sm:rounded-2xl border border-border-default bg-elevated p-3 max-[820px]:p-2.5 flex justify-between items-center group">
+                <div className="rounded-xl sm:rounded-2xl border border-border-default bg-elevated p-3 max-[820px]:p-2.5 short:p-2.5 flex justify-between items-center group">
                   <span className="text-lg sm:text-xl max-[820px]:text-base font-mono font-bold text-accent">
                     {peerId || "..."}
                   </span>
@@ -99,7 +99,7 @@ const CallSetup: React.FC<CallSetupProps> = ({
               </div>
 
               {/* Real Estate Quick Preset */}
-              <div className="rounded-xl border border-accent/30 bg-accent-soft p-2.5 flex items-center justify-between gap-2">
+              <div className="rounded-xl border border-accent/30 bg-accent-soft p-2.5 short:p-2 flex items-center justify-between gap-2">
                 <div className="flex items-center gap-2 min-w-0">
                   <span className="text-base sm:text-lg">🏡</span>
                   <div className="min-w-0">
@@ -131,14 +131,14 @@ const CallSetup: React.FC<CallSetupProps> = ({
               </div>
 
               <div className="grid grid-cols-[1fr_auto_1fr] items-end gap-1.5 sm:gap-2">
-                <div className="flex flex-col gap-1.5">
+                <div className="flex flex-col gap-1.5 short:gap-1">
                   <label className="text-[10px] sm:text-xs font-bold uppercase text-text-muted px-1">
                     {uiText.iSpeak}
                   </label>
                   <select
                     value={myLang}
                     onChange={(e) => onMyLangChange(e.target.value)}
-                    className="field-control rounded-lg sm:rounded-xl p-2.5 max-[820px]:p-2 text-xs sm:text-sm font-semibold"
+                    className="field-control rounded-lg sm:rounded-xl p-2.5 max-[820px]:p-2 short:p-2 text-xs sm:text-sm font-semibold"
                   >
                     {supportedLanguages
                       .filter((l) => l.code !== "auto")
@@ -164,14 +164,14 @@ const CallSetup: React.FC<CallSetupProps> = ({
                   <i className="fas fa-right-left text-xs sm:text-sm"></i>
                 </button>
 
-                <div className="flex flex-col gap-1.5">
+                <div className="flex flex-col gap-1.5 short:gap-1">
                   <label className="text-[10px] sm:text-xs font-bold uppercase text-text-muted px-1">
                     {uiText.theySpeak}
                   </label>
                   <select
                     value={remoteLang}
                     onChange={(e) => onRemoteLangChange(e.target.value)}
-                    className="field-control rounded-lg sm:rounded-xl p-2.5 max-[820px]:p-2 text-xs sm:text-sm font-semibold"
+                    className="field-control rounded-lg sm:rounded-xl p-2.5 max-[820px]:p-2 short:p-2 text-xs sm:text-sm font-semibold"
                   >
                     {supportedLanguages
                       .filter((l) => l.code !== "auto")
@@ -184,14 +184,14 @@ const CallSetup: React.FC<CallSetupProps> = ({
                 </div>
               </div>
 
-              <div className="flex flex-col gap-1.5">
+              <div className="flex flex-col gap-1.5 short:gap-1">
                 <label className="text-[10px] sm:text-xs font-bold uppercase text-text-muted px-1">
                   {uiText.callQuality}
                 </label>
                 <select
                   value={quality}
                   onChange={(e) => onQualityChange(e.target.value)}
-                  className="field-control rounded-lg sm:rounded-xl p-2.5 max-[820px]:p-2 text-sm"
+                  className="field-control rounded-lg sm:rounded-xl p-2.5 max-[820px]:p-2 short:p-2 text-sm"
                 >
                   {(
                     Object.entries(qualityProfiles) as Array<
@@ -205,9 +205,9 @@ const CallSetup: React.FC<CallSetupProps> = ({
                 </select>
               </div>
 
-              <div className="h-px bg-border-default my-1"></div>
+              <div className="h-px bg-border-default my-1 short:my-0.5"></div>
 
-              <div className="flex flex-col gap-1.5">
+              <div className="flex flex-col gap-1.5 short:gap-1">
                 <label className="text-[10px] sm:text-xs font-bold uppercase text-text-muted px-1">
                   {uiText.joinRoom}
                 </label>
@@ -218,20 +218,20 @@ const CallSetup: React.FC<CallSetupProps> = ({
                   onChange={(e) =>
                     onTargetPeerChange(e.target.value.toUpperCase())
                   }
-                  className="field-control rounded-xl sm:rounded-2xl p-3 max-[820px]:p-2.5 text-lg sm:text-xl max-[820px]:text-base font-mono"
+                  className="field-control rounded-xl sm:rounded-2xl p-3 max-[820px]:p-2.5 short:p-2.5 text-lg sm:text-xl max-[820px]:text-base font-mono"
                 />
                 <div className="flex gap-2">
                   <button
                     type="button"
                     onClick={onCopyInviteLink}
-                    className="btn-secondary flex-1 text-xs sm:text-sm py-2 rounded-lg"
+                    className="btn-secondary flex-1 text-xs sm:text-sm py-2 short:py-1.5 rounded-lg"
                   >
                     {uiText.copyInviteLink}
                   </button>
                   <button
                     type="button"
                     onClick={onRunPrecallCheck}
-                    className="btn-secondary flex-1 text-xs sm:text-sm py-2 rounded-lg"
+                    className="btn-secondary flex-1 text-xs sm:text-sm py-2 short:py-1.5 rounded-lg"
                   >
                     {isRunningPrecallCheck
                       ? uiText.checkingPrecheck
@@ -249,7 +249,7 @@ const CallSetup: React.FC<CallSetupProps> = ({
             <button
               onClick={onStartCall}
               disabled={isConnecting}
-              className="btn-primary w-full disabled:opacity-50 font-bold py-2.5 max-[820px]:py-2 rounded-xl sm:rounded-2xl transition-all flex items-center justify-center gap-2.5"
+              className="btn-primary w-full disabled:opacity-50 font-bold py-2.5 max-[820px]:py-2 short:py-2 rounded-xl sm:rounded-2xl transition-all flex items-center justify-center gap-2.5"
             >
               {isConnecting ? (
                 <i className="fas fa-circle-notch animate-spin"></i>

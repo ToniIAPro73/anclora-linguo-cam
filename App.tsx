@@ -2488,7 +2488,7 @@ const App: React.FC = () => {
     return (
       <>
         <div className="app-shell h-dvh flex flex-col overflow-hidden relative">
-          <div className="shrink-0 px-3 py-3 sm:px-5 sm:py-4 border-b border-border-subtle">
+          <div className="shrink-0 px-3 py-3 sm:px-5 sm:py-4 short:py-2 border-b border-border-subtle">
           <div className="relative mx-auto flex w-full max-w-225 flex-wrap items-center justify-between gap-3 sm:flex-nowrap">
             <div className="glass-panel flex items-center gap-2 rounded-xl px-3 py-2">
               <i className="fas fa-globe text-text-secondary text-xs"></i>

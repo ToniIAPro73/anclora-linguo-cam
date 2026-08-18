@@ -20,7 +20,7 @@ export function LegalFooter({
   return (
     <footer
       data-testid="legal-footer"
-      className={`${positionClass} z-20 border-t border-border-subtle bg-background/90 px-4 py-3 text-[11px] text-text-muted backdrop-blur`}
+      className={`${positionClass} z-20 border-t border-border-subtle bg-background/90 px-4 py-3 short:py-2 text-[11px] text-text-muted backdrop-blur`}
     >
       <div className="mx-auto flex w-full max-w-7xl flex-wrap items-center justify-between gap-3">
         <span>
