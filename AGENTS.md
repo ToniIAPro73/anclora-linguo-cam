@@ -1,3 +1,10 @@
+
+> [!IMPORTANT]
+> This repository is governed by the Anclora canonical contracts under `.anclora/`.
+> Agent-specific defaults, personal presets, or global agent configurations must NOT override those contracts.
+> Read `.anclora/AGENT_PROJECT_CONTEXT.md` before starting substantial work.
+
+
 <!-- ANCLORA-ECOSYSTEM-CONTEXT-START -->
 
 ## Contexto de ecosistema Anclora
@@ -11,7 +18,7 @@ Antes de modificar este repositorio, todo agente debe leer:
 
 La arquitectura estable del ecosistema se define en:
 
-`Boveda-Anclora/contracts/core/ANCLORA_ECOSYSTEM_ARCHITECTURE_CONTRACT.md`
+`anclora-vault/00-governance/contracts/core/ANCLORA_ECOSYSTEM_ARCHITECTURE_CONTRACT.md` (renombrado desde `Boveda-Anclora`)
 
 No asumir infraestructura compartida entre productos. Validar siempre hosting, backend, base de datos, auth, variables y ramas.
 
