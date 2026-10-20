@@ -4,7 +4,7 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node ../anclora-infrastructure/scripts/free-port.mjs && vite --port 3020 --strictPort",
     "build": "vite build",
     "preview": "vite preview",
     "lint": "eslint .",
